@@ -19,8 +19,8 @@ from cloud_state import CloudStateStore
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="多空掃描 V0.5.1", layout="wide")
-st.title("全市場多空掃描 V0.5.1｜SMC 二階段精查＋GitHub 免費保存")
+st.set_page_config(page_title="多空掃描 V0.5.2", layout="wide")
+st.title("全市場多空掃描 V0.5.2｜SMC 二階段精查＋GitHub 免費保存")
 st.caption(
     "預設掃描全部 Bybit USDT 永續，不綁成交量排名。"
     "建立清單後按一次「開始／繼續自動掃描」，系統會自動分批往下掃到全部完成；"
@@ -909,13 +909,21 @@ def cloud_save_all(show_message: bool = False) -> bool:
         # 另外存一份精查結果給「即時進場監控」直接讀取，
         # 避免監控頁需要解析整包掃描狀態。
         precision_rows = st.session_state.get("precision_rows", [])
-        if precision_rows:
+        precision_queue = st.session_state.get("precision_queue", [])
+        if precision_rows or precision_queue:
             cloud_store.save(
                 CLOUD_MONITOR_SOURCE_KEY,
                 {
-                    "version": "V0.5",
+                    "version": "V0.5.2",
                     "precision_rows": precision_rows,
+                    "precision_queue": precision_queue,
+                    "precision_pos": st.session_state.get("precision_pos", 0),
+                    "precision_errors": st.session_state.get("precision_errors", []),
                     "precision_finished": st.session_state.get("precision_finished"),
+                    "precision_seconds_total": st.session_state.get("precision_seconds_total", 0.0),
+                    "precision_processed_total": st.session_state.get("precision_processed_total", 0),
+                    "precision_retry_total": st.session_state.get("precision_retry_total", 0),
+                    "precision_signature": st.session_state.get("precision_signature"),
                 },
             )
 
@@ -967,6 +975,69 @@ def cloud_restore_all(show_message: bool = False) -> bool:
         return False
 
 
+def cloud_restore_precision_fallback(show_message: bool = False) -> bool:
+    """補回獨立 precision/latest，避免 F5 後第二階段進度歸零。"""
+    if not cloud_store.available:
+        return False
+
+    try:
+        body = cloud_store.load(CLOUD_MONITOR_SOURCE_KEY)
+        if not body:
+            return False
+
+        payload = body.get("payload", {}) or {}
+        precision_rows = payload.get("precision_rows", []) or []
+        precision_queue = payload.get("precision_queue", []) or []
+        precision_finished = payload.get("precision_finished")
+
+        if not precision_rows and not precision_queue:
+            return False
+
+        # V0.5.2 之後可完整還原 dedicated precision state。
+        for key in [
+            "precision_queue",
+            "precision_pos",
+            "precision_rows",
+            "precision_errors",
+            "precision_finished",
+            "precision_seconds_total",
+            "precision_processed_total",
+            "precision_retry_total",
+            "precision_signature",
+        ]:
+            if key in payload and payload.get(key) is not None:
+                st.session_state[key] = payload.get(key)
+
+        # 相容 V0.5 舊 precision/latest：舊版只有 rows + finished。
+        if "precision_rows" not in payload:
+            st.session_state["precision_rows"] = precision_rows
+
+        if "precision_pos" not in payload:
+            queue = st.session_state.get("precision_queue", []) or []
+            restored_pos = len(precision_rows)
+            if precision_finished and queue:
+                restored_pos = len(queue)
+            current_pos = int(st.session_state.get("precision_pos", 0) or 0)
+            st.session_state["precision_pos"] = max(current_pos, restored_pos)
+
+        if precision_finished:
+            st.session_state["precision_finished"] = precision_finished
+            st.session_state["precision_auto"] = False
+
+        st.session_state["precision_dedicated_saved_at"] = body.get("saved_at_utc")
+        st.session_state["precision_restore_error"] = None
+
+        if show_message:
+            st.success(f"☁️ 已補回第二階段精查結果：{len(precision_rows)} 筆。")
+        return True
+
+    except Exception as exc:
+        st.session_state["precision_restore_error"] = str(exc)
+        if show_message:
+            st.error(f"第二階段精查補回失敗：{exc}")
+        return False
+
+
 # 每個新 Streamlit session 只自動嘗試恢復一次。
 # 因此重新整理 / 重新開頁 / Cloud Run 換 revision 後，
 # 會自動把上一輪掃描結果拉回來。
@@ -974,6 +1045,9 @@ if "cloud_autorestore_attempted" not in st.session_state:
     st.session_state["cloud_autorestore_attempted"] = True
     if "scan_rows" not in st.session_state:
         cloud_restore_all(show_message=False)
+
+    # V0.5.2：再讀一次獨立 precision/latest，補回最新第二階段結果。
+    cloud_restore_precision_fallback(show_message=False)
 
 # =============================================================================
 # Sidebar settings
@@ -1078,7 +1152,9 @@ if manual_cloud_save:
     cloud_save_all(show_message=True)
 
 if manual_cloud_load:
-    if cloud_restore_all(show_message=True):
+    restored_main = cloud_restore_all(show_message=True)
+    restored_precision = cloud_restore_precision_fallback(show_message=True)
+    if restored_main or restored_precision:
         st.rerun()
 
 cloud_delete_clicked = st.sidebar.button(
@@ -1098,7 +1174,7 @@ if cloud_delete_clicked:
         st.sidebar.error(f"刪除雲端結果失敗：{exc}")
 
 st.sidebar.caption(
-    "V0.5.1 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。重新整理或重新開啟網站時會自動恢復，因此已移除手動 CSV 復原區。"
+    "V0.5.2 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。重新整理或重新開啟網站時會自動恢復，因此已移除手動 CSV 復原區。"
 )
 
 st.sidebar.markdown("### V0.4 第二階段精查")
