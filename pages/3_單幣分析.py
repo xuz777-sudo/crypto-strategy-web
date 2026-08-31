@@ -13,7 +13,7 @@ from smc_engine import analyze_smc
 
 
 st.set_page_config(page_title="單幣分析", layout="wide")
-st.title("單幣完整分析 V0.2｜SMC 多週期")
+st.title("單幣完整分析 V0.2.1｜SMC 多週期")
 st.caption("1H / 15分K 判斷方向，5分K負責短線進出場；整合 BOS、CHoCH、FVG、Order Block、Liquidity Sweep、Premium / Discount。")
 
 
@@ -31,6 +31,18 @@ def fmt_price(v):
         return f"{v:.8f}".rstrip("0").rstrip(".")
     except Exception:
         return str(v)
+
+
+def find_column(df, candidates):
+    """Case-insensitive column finder."""
+    if df is None or df.empty:
+        return None
+    normalized = {str(c).replace("_", "").lower(): c for c in df.columns}
+    for name in candidates:
+        key = str(name).replace("_", "").lower()
+        if key in normalized:
+            return normalized[key]
+    return None
 
 
 def bias_zh(v):
@@ -372,7 +384,8 @@ try:
         )
 
     with tab3:
-        st.markdown("#### 原策略 score_engine 評分")
+        st.markdown("#### 原策略 score_engine 輔助評分")
+        st.info("此區是原本技術指標/籌碼輔助分數；若與頁首多週期 SMC 結論不同，實際進場判斷以 MTF SMC 為主。")
         a, b, d, e = st.columns(4)
         a.metric("目前價", fmt_price(base_score["last_price"]))
         b.metric("LONG", base_score["long_score"])
@@ -402,20 +415,59 @@ try:
         else:
             d1.metric("Open Interest", "-")
 
-        # 欄位依 Bybit 回傳資料動態顯示，避免不同版本欄位造成頁面失敗。
+        # Bybit Long/Short Ratio：
+        # 不可以直接抓第一個非 timestamp 欄位，因為第一欄常常是 symbol，
+        # 會造成畫面錯誤顯示 BTCUSDT。這裡明確抓 buyRatio / sellRatio。
         if not ratio.empty:
-            ratio_cols = [x for x in ratio.columns if x not in {"timestamp"}]
-            d2.metric("Long/Short Ratio", str(ratio.iloc[0][ratio_cols[0]]) if ratio_cols else "-")
+            buy_col = find_column(ratio, ["buyRatio", "buy_ratio", "buy"])
+            sell_col = find_column(ratio, ["sellRatio", "sell_ratio", "sell"])
+            ratio_col = find_column(ratio, ["longShortRatio", "long_short_ratio", "ratio"])
+
+            buy_value = None
+            sell_value = None
+            ls_value = None
+
+            try:
+                if buy_col is not None:
+                    buy_value = float(ratio.iloc[0][buy_col])
+                if sell_col is not None:
+                    sell_value = float(ratio.iloc[0][sell_col])
+                if buy_value is not None and sell_value is not None and sell_value != 0:
+                    ls_value = buy_value / sell_value
+                elif ratio_col is not None:
+                    ls_value = float(ratio.iloc[0][ratio_col])
+            except Exception:
+                ls_value = None
+
+            if ls_value is not None and math.isfinite(ls_value):
+                d2.metric("Long/Short Ratio", f"{ls_value:.4f}")
+                if buy_value is not None and sell_value is not None:
+                    d2.caption(
+                        f"Buy {buy_value * 100:.2f}% ｜ Sell {sell_value * 100:.2f}%"
+                    )
+            elif buy_value is not None and sell_value is not None:
+                d2.metric("Long/Short Ratio", "-")
+                d2.caption(
+                    f"Buy {buy_value * 100:.2f}% ｜ Sell {sell_value * 100:.2f}%"
+                )
+            else:
+                d2.metric("Long/Short Ratio", "-")
         else:
             d2.metric("Long/Short Ratio", "-")
 
+        # Funding 以百分比顯示，0.0001 -> 0.0100%
         if not funding.empty:
-            funding_candidates = [
-                x for x in ["fundingRate", "funding_rate"]
-                if x in funding.columns
-            ]
-            if funding_candidates:
-                d3.metric("Funding", str(funding[funding_candidates[0]].iloc[0]))
+            funding_col = find_column(funding, ["fundingRate", "funding_rate"])
+            if funding_col is not None:
+                try:
+                    funding_value = float(funding.iloc[0][funding_col])
+                    if math.isfinite(funding_value):
+                        d3.metric("Funding", f"{funding_value * 100:.4f}%")
+                        d3.caption(f"Raw: {funding_value:.8f}")
+                    else:
+                        d3.metric("Funding", "-")
+                except Exception:
+                    d3.metric("Funding", "-")
             else:
                 d3.metric("Funding", "-")
         else:
