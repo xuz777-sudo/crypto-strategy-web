@@ -19,8 +19,8 @@ from cloud_state import CloudStateStore
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="多空掃描 V0.5", layout="wide")
-st.title("全市場多空掃描 V0.5｜SMC 二階段精查＋GitHub 免費保存")
+st.set_page_config(page_title="多空掃描 V0.5.1", layout="wide")
+st.title("全市場多空掃描 V0.5.1｜SMC 二階段精查＋GitHub 免費保存")
 st.caption(
     "預設掃描全部 Bybit USDT 永續，不綁成交量排名。"
     "建立清單後按一次「開始／繼續自動掃描」，系統會自動分批往下掃到全部完成；"
@@ -1098,7 +1098,7 @@ if cloud_delete_clicked:
         st.sidebar.error(f"刪除雲端結果失敗：{exc}")
 
 st.sidebar.caption(
-    "V0.5 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。"
+    "V0.5.1 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。重新整理或重新開啟網站時會自動恢復，因此已移除手動 CSV 復原區。"
 )
 
 st.sidebar.markdown("### V0.4 第二階段精查")
@@ -1159,55 +1159,8 @@ precision_between_batch_delay = st.sidebar.number_input(
     format="%.1f",
 )
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 復用第一階段結果")
-stage1_upload = st.sidebar.file_uploader(
-    "匯入 V0.3/V0.4 掃描結果 CSV",
-    type=["csv"],
-    help="升級部署後可匯入剛才下載的 735 檔 CSV，避免重新掃第一階段約 10 分鐘。",
-)
-load_stage1_csv_clicked = st.sidebar.button(
-    "載入 CSV 作為第一階段完成結果",
-    use_container_width=True,
-)
-
 signature = f"{mode}|{int(quick_n)}"
 
-
-
-if load_stage1_csv_clicked:
-    if stage1_upload is None:
-        st.sidebar.error("請先選擇第一階段 CSV。")
-    else:
-        try:
-            imported = pd.read_csv(stage1_upload)
-            imported = normalize_stage1_import(imported)
-
-            reset_scan()
-
-            rows = imported.to_dict("records")
-            symbols = imported["Symbol"].astype(str).tolist()
-
-            st.session_state["scan_rows"] = rows
-            st.session_state["scan_universe"] = [{"symbol": s} for s in symbols]
-            st.session_state["scan_pos"] = len(rows)
-            st.session_state["scan_errors"] = []
-            st.session_state["scan_mode"] = "CSV匯入"
-            st.session_state["scan_started"] = datetime.now(timezone.utc).isoformat()
-            st.session_state["scan_finished"] = datetime.now(timezone.utc).isoformat()
-            st.session_state["scan_signature"] = signature
-            st.session_state["scan_seconds_total"] = 0.0
-            st.session_state["scan_processed_total"] = len(rows)
-            st.session_state["scan_retry_total"] = 0
-            st.session_state["auto_scan"] = False
-            st.session_state["last_batch_count"] = 0
-            st.session_state["last_batch_seconds"] = 0.0
-
-            st.sidebar.success(f"已載入第一階段結果：{len(rows)} 檔")
-            cloud_save_all(show_message=False)
-            st.rerun()
-        except Exception as exc:
-            st.sidebar.error(f"CSV 載入失敗：{exc}")
 
 
 # =============================================================================
