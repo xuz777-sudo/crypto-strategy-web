@@ -12,14 +12,15 @@ from bybit_client import BybitClient
 from smc_engine import analyze_smc
 from score_engine import score_symbol
 from strategy_engine import build_trade_plan
+from cloud_state import CloudStateStore
 
 
 # =============================================================================
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="多空掃描 V0.4", layout="wide")
-st.title("全市場多空掃描 V0.4｜SMC 二階段精查")
+st.set_page_config(page_title="多空掃描 V0.5", layout="wide")
+st.title("全市場多空掃描 V0.5｜SMC 二階段精查＋GitHub 免費保存")
 st.caption(
     "預設掃描全部 Bybit USDT 永續，不綁成交量排名。"
     "建立清單後按一次「開始／繼續自動掃描」，系統會自動分批往下掃到全部完成；"
@@ -841,6 +842,139 @@ def estimated_eta(total: int, done: int) -> str:
     return fmt_duration(avg_seconds * remaining)
 
 
+
+# =============================================================================
+# V0.5 Cloud persistence
+# =============================================================================
+
+CLOUD_SCAN_KEY = "market_scan/latest"
+CLOUD_MONITOR_SOURCE_KEY = "precision/latest"
+
+cloud_store = CloudStateStore()
+
+
+def cloud_snapshot() -> dict:
+    """Serialize current first/second-stage state for durable cloud storage."""
+    keys = [
+        # Stage 1
+        "scan_universe",
+        "scan_pos",
+        "scan_rows",
+        "scan_errors",
+        "scan_mode",
+        "scan_started",
+        "scan_finished",
+        "scan_signature",
+        "scan_seconds_total",
+        "scan_processed_total",
+        "scan_retry_total",
+        "auto_scan",
+        "last_batch_count",
+        "last_batch_seconds",
+
+        # Stage 2
+        "precision_queue",
+        "precision_pos",
+        "precision_rows",
+        "precision_errors",
+        "precision_auto",
+        "precision_started",
+        "precision_finished",
+        "precision_seconds_total",
+        "precision_processed_total",
+        "precision_retry_total",
+        "precision_last_batch_count",
+        "precision_last_batch_seconds",
+        "precision_signature",
+    ]
+
+    return {
+        "version": "V0.5",
+        "saved_from": "2_多空掃描.py",
+        "state": {
+            key: st.session_state.get(key)
+            for key in keys
+            if key in st.session_state
+        },
+    }
+
+
+def cloud_save_all(show_message: bool = False) -> bool:
+    if not cloud_store.available:
+        return False
+
+    try:
+        result = cloud_store.save(CLOUD_SCAN_KEY, cloud_snapshot())
+
+        # 另外存一份精查結果給「即時進場監控」直接讀取，
+        # 避免監控頁需要解析整包掃描狀態。
+        precision_rows = st.session_state.get("precision_rows", [])
+        if precision_rows:
+            cloud_store.save(
+                CLOUD_MONITOR_SOURCE_KEY,
+                {
+                    "version": "V0.5",
+                    "precision_rows": precision_rows,
+                    "precision_finished": st.session_state.get("precision_finished"),
+                },
+            )
+
+        st.session_state["cloud_last_saved"] = result.get("saved_at_utc")
+        st.session_state["cloud_last_error"] = None
+
+        if show_message:
+            st.success("☁️ 已將掃描與精查結果保存到雲端。")
+        return True
+
+    except Exception as exc:
+        st.session_state["cloud_last_error"] = str(exc)
+        if show_message:
+            st.error(f"雲端保存失敗：{exc}")
+        return False
+
+
+def cloud_restore_all(show_message: bool = False) -> bool:
+    if not cloud_store.available:
+        return False
+
+    try:
+        body = cloud_store.load(CLOUD_SCAN_KEY)
+        if not body:
+            if show_message:
+                st.info("雲端目前沒有已保存的掃描結果。")
+            return False
+
+        payload = body.get("payload", {}) or {}
+        state = payload.get("state", {}) or {}
+
+        for key, value in state.items():
+            st.session_state[key] = value
+
+        st.session_state["cloud_last_loaded"] = body.get("saved_at_utc")
+        st.session_state["cloud_last_error"] = None
+
+        if show_message:
+            st.success(
+                f"☁️ 已從雲端恢復掃描狀態。"
+                f"保存時間：{body.get('saved_at_utc', '-')}"
+            )
+        return True
+
+    except Exception as exc:
+        st.session_state["cloud_last_error"] = str(exc)
+        if show_message:
+            st.error(f"雲端恢復失敗：{exc}")
+        return False
+
+
+# 每個新 Streamlit session 只自動嘗試恢復一次。
+# 因此重新整理 / 重新開頁 / Cloud Run 換 revision 後，
+# 會自動把上一輪掃描結果拉回來。
+if "cloud_autorestore_attempted" not in st.session_state:
+    st.session_state["cloud_autorestore_attempted"] = True
+    if "scan_rows" not in st.session_state:
+        cloud_restore_all(show_message=False)
+
 # =============================================================================
 # Sidebar settings
 # =============================================================================
@@ -926,6 +1060,47 @@ min_show_score = st.sidebar.slider(
 )
 
 st.sidebar.markdown("---")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### ☁️ GitHub 免費雲端保存")
+
+cloud_status = cloud_store.status()
+
+if cloud_status.get("ok"):
+    st.sidebar.success(cloud_status["message"])
+else:
+    st.sidebar.warning(cloud_status["message"])
+
+cc1, cc2 = st.sidebar.columns(2)
+manual_cloud_save = cc1.button("立即存雲端", use_container_width=True)
+manual_cloud_load = cc2.button("從雲端恢復", use_container_width=True)
+
+if manual_cloud_save:
+    cloud_save_all(show_message=True)
+
+if manual_cloud_load:
+    if cloud_restore_all(show_message=True):
+        st.rerun()
+
+cloud_delete_clicked = st.sidebar.button(
+    "刪除雲端掃描結果",
+    use_container_width=True,
+)
+
+if cloud_delete_clicked:
+    try:
+        deleted1 = cloud_store.delete(CLOUD_SCAN_KEY) if cloud_store.available else False
+        deleted2 = cloud_store.delete(CLOUD_MONITOR_SOURCE_KEY) if cloud_store.available else False
+        if deleted1 or deleted2:
+            st.sidebar.success("GitHub 掃描／精查結果已刪除。")
+        else:
+            st.sidebar.info("GitHub 儲存庫沒有可刪除的結果。")
+    except Exception as exc:
+        st.sidebar.error(f"刪除雲端結果失敗：{exc}")
+
+st.sidebar.caption(
+    "V0.5 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。"
+)
+
 st.sidebar.markdown("### V0.4 第二階段精查")
 
 precision_include_mode = st.sidebar.radio(
@@ -1029,6 +1204,7 @@ if load_stage1_csv_clicked:
             st.session_state["last_batch_seconds"] = 0.0
 
             st.sidebar.success(f"已載入第一階段結果：{len(rows)} 檔")
+            cloud_save_all(show_message=False)
             st.rerun()
         except Exception as exc:
             st.sidebar.error(f"CSV 載入失敗：{exc}")
@@ -1077,6 +1253,7 @@ if build_clicked:
         st.session_state["last_batch_seconds"] = 0.0
 
         st.success(f"掃描清單建立完成：{len(universe_df)} 檔")
+        cloud_save_all(show_message=False)
     except Exception as exc:
         st.error(f"建立掃描清單失敗：{exc}")
 
@@ -1255,6 +1432,9 @@ if should_run_batch:
 
     new_position = int(st.session_state.get("scan_pos", 0))
     new_remaining = max(total - new_position, 0)
+
+    # V0.5：每一批完成立即寫入 GitHub 私有儲存。
+    cloud_save_all(show_message=False)
 
     if new_remaining == 0:
         st.session_state["auto_scan"] = False
@@ -1545,6 +1725,7 @@ if current_position >= total:
             f"第二階段精查清單建立完成：{len(queue_df)} 檔。"
             "多空就緒標的全部納入；觀察標的依精查門檻篩選。"
         )
+        cloud_save_all(show_message=False)
         st.rerun()
 
     precision_queue = st.session_state.get("precision_queue", [])
@@ -1686,10 +1867,14 @@ if current_position >= total:
             new_pos = int(st.session_state.get("precision_pos", 0))
             new_remaining = max(precision_total - new_pos, 0)
 
+            # V0.5：第二階段每批完成立即雲端保存。
+            cloud_save_all(show_message=False)
+
             if new_remaining == 0:
                 st.session_state["precision_auto"] = False
                 st.session_state["precision_finished"] = datetime.now(timezone.utc).isoformat()
-                precision_status.success("✅ 第二階段精查全部完成。")
+                cloud_save_all(show_message=False)
+                precision_status.success("✅ 第二階段精查全部完成，結果已保存到雲端。")
                 time.sleep(0.5)
                 st.rerun()
 
