@@ -30,6 +30,8 @@ Bybit / Crypto 5m short-term trading Smart Money Concepts engine.
 
 from __future__ import annotations
 
+SMC_ENGINE_BUILD = "V0.1-COMPAT-20260831"
+
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
 import math
@@ -1132,6 +1134,129 @@ def get_smc_score(
     }
 
 
+
+# ---------------------------------------------------------------------
+# Legacy compatibility API
+# ---------------------------------------------------------------------
+
+def latest_smc(
+    df: pd.DataFrame,
+    config: Optional[SMCConfig] = None,
+) -> Dict[str, Any]:
+    """
+    Backward-compatible adapter for the original project.
+
+    Existing modules such as score_engine.py and strategy_engine.py expect:
+        structure
+        bull_bos / bear_bos
+        bull_sweep / bear_sweep
+        bull_fvg / bear_fvg
+        bull_displacement / bear_displacement
+        last_swing_high / last_swing_low
+
+    This adapter maps SMCEngine V0.1 output into that legacy schema so the
+    existing pages can continue to work while newer code can use analyze_smc().
+    """
+    cfg = config or SMCConfig()
+    result = analyze_smc(df, config=cfg, include_dataframe=True)
+    x = result["enriched_df"]
+    last_i = len(x) - 1
+
+    structure_state = result.get("structure_state", "neutral")
+    structure = (
+        "BULL" if structure_state == "bullish"
+        else "BEAR" if structure_state == "bearish"
+        else "NEUTRAL"
+    )
+
+    latest_structure = result.get("latest_structure")
+    bull_bos = False
+    bear_bos = False
+
+    if latest_structure:
+        age = last_i - int(latest_structure.get("index", -10**9))
+        fresh = age <= cfg.signal_fresh_bars
+        if fresh and latest_structure.get("type") in {"BOS", "CHoCH"}:
+            bull_bos = latest_structure.get("side") == "bullish"
+            bear_bos = latest_structure.get("side") == "bearish"
+
+    latest_sweep_ev = result.get("latest_liquidity_sweep")
+    bull_sweep = False
+    bear_sweep = False
+
+    if latest_sweep_ev:
+        age = last_i - int(latest_sweep_ev.get("index", -10**9))
+        fresh = age <= cfg.sweep_max_age
+        if fresh:
+            # sell-side sweep is bullish; buy-side sweep is bearish.
+            bull_sweep = latest_sweep_ev.get("bias") == "bullish"
+            bear_sweep = latest_sweep_ev.get("bias") == "bearish"
+
+    active_fvgs = result.get("active_fvgs", []) or []
+    price = float(x["close"].iloc[-1])
+    atr = float(x["atr"].iloc[-1]) if pd.notna(x["atr"].iloc[-1]) else 0.0
+    fvg_tol = atr * 0.20
+
+    def _near_fvg(side: str) -> bool:
+        for f in active_fvgs:
+            if f.get("side") != side:
+                continue
+            try:
+                lo = float(f["low"])
+                hi = float(f["high"])
+            except Exception:
+                continue
+            if (lo - fvg_tol) <= price <= (hi + fvg_tol):
+                return True
+            # Also allow a freshly created unfilled FVG as a signal.
+            age = last_i - int(f.get("index", -10**9))
+            if age <= cfg.signal_fresh_bars:
+                return True
+        return False
+
+    bull_fvg = _near_fvg("bullish")
+    bear_fvg = _near_fvg("bearish")
+
+    # Legacy "displacement" flag:
+    # strong candle body relative to ATR, closing in candle direction.
+    row = x.iloc[-1]
+    body = abs(float(row["close"]) - float(row["open"]))
+    bull_displacement = False
+    bear_displacement = False
+    if atr > 0:
+        strong = body >= atr * 0.60
+        bull_displacement = strong and float(row["close"]) > float(row["open"])
+        bear_displacement = strong and float(row["close"]) < float(row["open"])
+
+    last_sh = result.get("last_swing_high")
+    last_sl = result.get("last_swing_low")
+
+    return {
+        "structure": structure,
+        "bull_bos": bool(bull_bos),
+        "bear_bos": bool(bear_bos),
+        "bull_sweep": bool(bull_sweep),
+        "bear_sweep": bool(bear_sweep),
+        "bull_fvg": bool(bull_fvg),
+        "bear_fvg": bool(bear_fvg),
+        "bull_displacement": bool(bull_displacement),
+        "bear_displacement": bool(bear_displacement),
+        "last_swing_high": (
+            float(last_sh["price"]) if isinstance(last_sh, dict) and last_sh.get("price") is not None
+            else np.nan
+        ),
+        "last_swing_low": (
+            float(last_sl["price"]) if isinstance(last_sl, dict) and last_sl.get("price") is not None
+            else np.nan
+        ),
+        # Extra fields are harmless to legacy callers and useful for debugging.
+        "bias": result.get("bias", "NEUTRAL"),
+        "long_score": result.get("long_score", 0),
+        "short_score": result.get("short_score", 0),
+        "latest_structure": latest_structure,
+        "latest_liquidity_sweep": latest_sweep_ev,
+    }
+
 __all__ = [
     "SMCConfig",
     "SMCEngine",
@@ -1145,4 +1270,5 @@ __all__ = [
     "analyze_smc",
     "calculate_smc",
     "get_smc_score",
+    "latest_smc",
 ]
