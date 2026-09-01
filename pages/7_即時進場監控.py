@@ -18,8 +18,8 @@ from strategy_engine import build_trade_plan
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="5分K即時進場監控 V0.5.3", layout="wide")
-st.title("5分K 即時進出場監控 V0.5.3｜虛擬持倉＋歷史績效")
+st.set_page_config(page_title="5分K即時進場監控 V0.5.4", layout="wide")
+st.title("5分K 即時進出場監控 V0.5.4｜真實化虛擬績效")
 st.caption(
     "讀取第二階段精查保存在 GitHub Private Repo 的候選，只更新候選的最新 5分K，"
     "不重新掃描全市場。所有交易皆為策略虛擬訊號，不代表 Bybit 真實下單。"
@@ -226,7 +226,7 @@ def save_monitor_payload(rows, locks):
     cloud.save(
         MONITOR_KEY,
         {
-            "version": "V0.5.3",
+            "version": "V0.5.4",
             "rows": rows,
             "locks": locks,
             "updated_at_utc": now_utc_dt().isoformat(),
@@ -241,7 +241,7 @@ def save_history_rows(history):
     cloud.save(
         HISTORY_KEY,
         {
-            "version": "V0.5.3",
+            "version": "V0.5.4",
             "history": history,
             "updated_at_utc": now_utc_dt().isoformat(),
         },
@@ -373,11 +373,179 @@ def closed_result_r(status, row, exit_price):
     )
 
 
+
+# =============================================================================
+# V0.5.4 realistic position sizing / trading costs
+# =============================================================================
+
+def apply_entry_slippage(direction, raw_entry, slippage_bps):
+    raw_entry = safe_float(raw_entry)
+    if not math.isfinite(raw_entry):
+        return raw_entry
+    slip = float(slippage_bps) / 10000.0
+    if direction == "多頭":
+        return raw_entry * (1.0 + slip)
+    if direction == "空頭":
+        return raw_entry * (1.0 - slip)
+    return raw_entry
+
+
+def apply_exit_slippage(direction, raw_exit, slippage_bps):
+    raw_exit = safe_float(raw_exit)
+    if not math.isfinite(raw_exit):
+        return raw_exit
+    slip = float(slippage_bps) / 10000.0
+    if direction == "多頭":
+        return raw_exit * (1.0 - slip)
+    if direction == "空頭":
+        return raw_exit * (1.0 + slip)
+    return raw_exit
+
+
+def position_metrics(
+    virtual_capital,
+    risk_pct,
+    entry,
+    stop,
+    fee_rate,
+    leverage,
+):
+    entry = safe_float(entry)
+    stop = safe_float(stop)
+
+    if (
+        not math.isfinite(entry)
+        or not math.isfinite(stop)
+        or entry <= 0
+    ):
+        return {}
+
+    risk_per_unit = abs(entry - stop)
+    if risk_per_unit <= 0:
+        return {}
+
+    capital = max(0.0, float(virtual_capital))
+    risk_budget = capital * float(risk_pct) / 100.0
+
+    qty_by_risk = risk_budget / risk_per_unit
+    max_notional = capital * max(1.0, float(leverage))
+    qty_by_leverage = max_notional / entry
+
+    qty = min(qty_by_risk, qty_by_leverage)
+    notional = qty * entry
+    effective_risk = qty * risk_per_unit
+    est_entry_fee = notional * float(fee_rate)
+
+    return {
+        "虛擬本金": capital,
+        "每筆風險%": float(risk_pct),
+        "風險預算USDT": risk_budget,
+        "槓桿倍數": float(leverage),
+        "虛擬數量": qty,
+        "名目部位USDT": notional,
+        "原始1R_USDT": effective_risk,
+        "預估進場手續費USDT": est_entry_fee,
+    }
+
+
+def calc_trade_pnl(
+    row,
+    raw_exit_price,
+    fee_rate,
+    slippage_bps,
+):
+    direction = str(row.get("方向", ""))
+    entry_exec = safe_float(
+        row.get("成交進場價", row.get("進場價"))
+    )
+    qty = safe_float(row.get("虛擬數量"), 0.0)
+    original_r = safe_float(row.get("原始1R_USDT"))
+
+    exit_exec = apply_exit_slippage(
+        direction,
+        raw_exit_price,
+        slippage_bps,
+    )
+
+    if not all(
+        math.isfinite(x)
+        for x in [entry_exec, exit_exec, qty]
+    ):
+        return {}
+
+    if direction == "多頭":
+        gross = (exit_exec - entry_exec) * qty
+    elif direction == "空頭":
+        gross = (entry_exec - exit_exec) * qty
+    else:
+        gross = 0.0
+
+    entry_notional = abs(entry_exec * qty)
+    exit_notional = abs(exit_exec * qty)
+    entry_fee = entry_notional * float(fee_rate)
+    exit_fee = exit_notional * float(fee_rate)
+    total_fee = entry_fee + exit_fee
+    net = gross - total_fee
+
+    net_r = (
+        net / original_r
+        if math.isfinite(original_r) and original_r > 0
+        else float("nan")
+    )
+
+    return {
+        "成交出場價": exit_exec,
+        "毛損益USDT": gross,
+        "進場手續費USDT": entry_fee,
+        "出場手續費USDT": exit_fee,
+        "總手續費USDT": total_fee,
+        "淨損益USDT": net,
+        "淨R": net_r,
+    }
+
+
+def history_equity_stats(history, starting_capital):
+    capital = float(starting_capital)
+    equity = capital
+
+    closed = []
+    for row in history:
+        pnl = safe_float(row.get("淨損益USDT"))
+        if math.isfinite(pnl):
+            closed.append((row, pnl))
+
+    closed.sort(
+        key=lambda x: str(x[0].get("出場時間UTC", ""))
+    )
+
+    peak = equity
+    max_dd = 0.0
+
+    for _, pnl in closed:
+        equity += pnl
+        peak = max(peak, equity)
+        if peak > 0:
+            dd = (peak - equity) / peak * 100.0
+            max_dd = max(max_dd, dd)
+
+    return {
+        "期初本金": capital,
+        "目前權益": equity,
+        "累積淨損益": equity - capital,
+        "報酬率%": (
+            (equity / capital - 1.0) * 100.0
+            if capital > 0
+            else 0.0
+        ),
+        "最大回撤%": max_dd,
+    }
+
+
 # =============================================================================
 # Existing virtual position lifecycle
 # =============================================================================
 
-def evaluate_open_trade(prev, last_bar, smc):
+def evaluate_open_trade(prev, last_bar, smc, fee_rate, slippage_bps):
     """
     Returns:
       None -> no active virtual position
@@ -502,6 +670,30 @@ def evaluate_open_trade(prev, last_bar, smc):
     result_r = closed_result_r(final_status, out, exit_price)
     out["結果R"] = round(result_r, 3) if math.isfinite(result_r) else None
 
+    pnl = calc_trade_pnl(
+        out,
+        raw_exit_price=exit_price,
+        fee_rate=float(fee_rate),
+        slippage_bps=float(slippage_bps),
+    )
+    out.update(pnl)
+
+    net_r = safe_float(out.get("淨R"))
+    if math.isfinite(net_r):
+        out["淨R"] = round(net_r, 3)
+
+    for key in [
+        "毛損益USDT",
+        "進場手續費USDT",
+        "出場手續費USDT",
+        "總手續費USDT",
+        "淨損益USDT",
+        "成交出場價",
+    ]:
+        value = safe_float(out.get(key))
+        if math.isfinite(value):
+            out[key] = round(value, 6 if key == "成交出場價" else 4)
+
     if final_status == "TP2 完成":
         out["提示"] = f"TP2 完成，本筆虛擬交易結果 {out.get('結果R')}R。"
     elif final_status == "停損出場":
@@ -527,6 +719,11 @@ def analyze_candidate(
     locked_structure,
     trigger_score,
     chase_atr,
+    virtual_capital,
+    risk_pct,
+    fee_rate,
+    slippage_bps,
+    leverage,
 ):
     symbol = str(precision_row["交易對"]).upper()
     direction = direction_code(precision_row)
@@ -548,7 +745,13 @@ def analyze_candidate(
 
     # Existing open virtual trade has priority.
     if prev:
-        lifecycle = evaluate_open_trade(prev, last, smc)
+        lifecycle = evaluate_open_trade(
+            prev,
+            last,
+            smc,
+            fee_rate=float(fee_rate),
+            slippage_bps=float(slippage_bps),
+        )
         if lifecycle:
             return lifecycle, signature
 
@@ -609,6 +812,21 @@ def analyze_candidate(
     tp1 = safe_float(plan.get("tp1"))
     tp2 = safe_float(plan.get("tp2"))
 
+    direction_zh = "多頭" if direction == "LONG" else "空頭"
+    exec_entry = apply_entry_slippage(
+        direction_zh,
+        entry,
+        slippage_bps,
+    )
+    sizing = position_metrics(
+        virtual_capital=virtual_capital,
+        risk_pct=risk_pct,
+        entry=exec_entry,
+        stop=stop,
+        fee_rate=fee_rate,
+        leverage=leverage,
+    )
+
     is_new_entry = status in {
         "多頭訊號成立",
         "空頭訊號成立",
@@ -618,7 +836,7 @@ def analyze_candidate(
 
     out = {
         "交易對": symbol,
-        "方向": "多頭" if direction == "LONG" else "空頭",
+        "方向": direction_zh,
         "精查分數": int(
             safe_float(
                 precision_row.get("最終精查分數"),
@@ -631,6 +849,7 @@ def analyze_candidate(
         "結構指紋": signature,
         "監控狀態": status,
         "進場價": entry,
+        "成交進場價": exec_entry,
         "原始停損": stop,
         "停損": stop,
         "TP1": tp1,
@@ -671,6 +890,27 @@ def analyze_candidate(
             else "等待下一根 5分K 確認。"
         ),
     }
+
+    if is_new_entry:
+        out.update(sizing)
+        out["費率%"] = float(fee_rate) * 100.0
+        out["滑價bps"] = float(slippage_bps)
+    elif prev:
+        for key in [
+            "虛擬本金",
+            "每筆風險%",
+            "風險預算USDT",
+            "槓桿倍數",
+            "虛擬數量",
+            "名目部位USDT",
+            "原始1R_USDT",
+            "預估進場手續費USDT",
+            "費率%",
+            "滑價bps",
+            "成交進場價",
+        ]:
+            if key in prev:
+                out[key] = prev.get(key)
 
     return out, signature
 
@@ -828,6 +1068,55 @@ auto_refresh = st.sidebar.toggle(
     value=True,
 )
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 真實化績效設定")
+
+virtual_capital = st.sidebar.number_input(
+    "虛擬本金（USDT）",
+    min_value=100.0,
+    max_value=10000000.0,
+    value=10000.0,
+    step=1000.0,
+)
+
+risk_pct = st.sidebar.slider(
+    "每筆風險（%本金）",
+    min_value=0.25,
+    max_value=5.00,
+    value=1.00,
+    step=0.25,
+)
+
+leverage = st.sidebar.number_input(
+    "部位槓桿上限",
+    min_value=1.0,
+    max_value=20.0,
+    value=3.0,
+    step=1.0,
+)
+
+fee_pct = st.sidebar.number_input(
+    "單邊手續費（%）",
+    min_value=0.0,
+    max_value=0.20,
+    value=0.055,
+    step=0.005,
+    format="%.3f",
+    help="預設 0.055% 作保守模擬，可依你的 Bybit 實際費率調整。",
+)
+
+slippage_bps = st.sidebar.number_input(
+    "單邊滑價（bps）",
+    min_value=0.0,
+    max_value=30.0,
+    value=2.0,
+    step=0.5,
+    format="%.1f",
+    help="1 bps = 0.01%，預設 2 bps = 0.02%。",
+)
+
+fee_rate = float(fee_pct) / 100.0
+
 manual_refresh = st.sidebar.button(
     "立即重新檢查",
     type="primary",
@@ -887,6 +1176,11 @@ def render_monitor():
                 locks.get(symbol),
                 trigger_score,
                 chase_atr,
+                virtual_capital,
+                risk_pct,
+                fee_rate,
+                slippage_bps,
+                leverage,
             )
 
             status_text = str(result.get("監控狀態", ""))
@@ -980,6 +1274,10 @@ def render_monitor():
     # -----------------------------------------------------------------
 
     stats = performance_stats(history)
+    equity_stats = history_equity_stats(
+        history,
+        virtual_capital,
+    )
 
     st.markdown("### 虛擬策略績效")
 
@@ -997,12 +1295,30 @@ def render_monitor():
         ),
     )
 
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric(
+        "目前模擬權益",
+        f'{equity_stats["目前權益"]:,.2f} USDT',
+    )
+    e2.metric(
+        "累積淨損益",
+        f'{equity_stats["累積淨損益"]:+,.2f} USDT',
+    )
+    e3.metric(
+        "淨報酬率",
+        f'{equity_stats["報酬率%"]:+.2f}%',
+    )
+    e4.metric(
+        "最大回撤",
+        f'{equity_stats["最大回撤%"]:.2f}%',
+    )
+
     st.caption(
         f'獲利 {stats["獲利筆"]} 筆 ｜ '
         f'虧損 {stats["虧損筆"]} 筆 ｜ '
         f'保本 {stats["保本筆"]} 筆。'
-        "R 以原始 Entry→Stop 風險距離為 1R；"
-        "不含手續費與滑價。"
+        "毛 R 以原始 Entry→Stop 風險距離為 1R；"
+        "V0.5.4 另計手續費、滑價、淨R與淨損益 USDT。"
     )
 
     # -----------------------------------------------------------------
@@ -1046,9 +1362,13 @@ def render_monitor():
             "5分K最新結構",
             "監控狀態",
             "進場價",
+            "成交進場價",
             "停損",
             "TP1",
             "TP2",
+            "虛擬數量",
+            "名目部位USDT",
+            "原始1R_USDT",
             "進場時間台灣",
             "持倉分鐘",
             "最後更新台灣",
@@ -1087,7 +1407,15 @@ def render_monitor():
                 "TP1",
                 "TP2",
                 "出場價",
+                "成交進場價",
+                "成交出場價",
+                "虛擬數量",
+                "名目部位USDT",
                 "結果R",
+                "淨R",
+                "毛損益USDT",
+                "總手續費USDT",
+                "淨損益USDT",
                 "進場時間台灣",
                 "出場時間台灣",
                 "持倉分鐘",
