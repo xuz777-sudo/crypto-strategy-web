@@ -18,8 +18,8 @@ from strategy_engine import build_trade_plan
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="5分K即時進場監控 V0.5.4", layout="wide")
-st.title("5分K 即時進出場監控 V0.5.4｜真實化虛擬績效")
+st.set_page_config(page_title="5分K即時進場監控 V0.5.4.1", layout="wide")
+st.title("5分K 即時進出場監控 V0.5.4.1｜真實化虛擬績效")
 st.caption(
     "讀取第二階段精查保存在 GitHub Private Repo 的候選，只更新候選的最新 5分K，"
     "不重新掃描全市場。所有交易皆為策略虛擬訊號，不代表 Bybit 真實下單。"
@@ -226,7 +226,7 @@ def save_monitor_payload(rows, locks):
     cloud.save(
         MONITOR_KEY,
         {
-            "version": "V0.5.4",
+            "version": "V0.5.4.1",
             "rows": rows,
             "locks": locks,
             "updated_at_utc": now_utc_dt().isoformat(),
@@ -241,7 +241,7 @@ def save_history_rows(history):
     cloud.save(
         HISTORY_KEY,
         {
-            "version": "V0.5.4",
+            "version": "V0.5.4.1",
             "history": history,
             "updated_at_utc": now_utc_dt().isoformat(),
         },
@@ -541,6 +541,65 @@ def history_equity_stats(history, starting_capital):
     }
 
 
+
+def backfill_legacy_position_costs(
+    row,
+    virtual_capital,
+    risk_pct,
+    fee_rate,
+    slippage_bps,
+    leverage,
+):
+    """
+    V0.5.4.1：
+    將 V0.5.3 以前已存在的虛擬持倉補上真實化績效欄位。
+    不改動原 Entry / Stop / TP，只補算成交價、部位大小與費用基礎。
+    """
+    if not row:
+        return row
+
+    out = dict(row)
+
+    direction = str(out.get("方向", ""))
+    raw_entry = safe_float(out.get("進場價"))
+    stop = safe_float(out.get("原始停損", out.get("停損")))
+
+    if not math.isfinite(raw_entry) or not math.isfinite(stop):
+        return out
+
+    # 已有成交進場價就沿用，避免每次刷新因設定改變而重算。
+    exec_entry = safe_float(out.get("成交進場價"))
+    if not math.isfinite(exec_entry):
+        exec_entry = apply_entry_slippage(
+            direction,
+            raw_entry,
+            slippage_bps,
+        )
+        out["成交進場價"] = exec_entry
+
+    # 已有部位大小就不回溯改變。
+    qty = safe_float(out.get("虛擬數量"))
+    if not math.isfinite(qty) or qty <= 0:
+        sizing = position_metrics(
+            virtual_capital=virtual_capital,
+            risk_pct=risk_pct,
+            entry=exec_entry,
+            stop=stop,
+            fee_rate=fee_rate,
+            leverage=leverage,
+        )
+        out.update(sizing)
+
+    out.setdefault("虛擬本金", float(virtual_capital))
+    out.setdefault("每筆風險%", float(risk_pct))
+    out.setdefault("槓桿倍數", float(leverage))
+    out.setdefault("費率%", float(fee_rate) * 100.0)
+    out.setdefault("滑價bps", float(slippage_bps))
+    out.setdefault("原始停損", stop)
+
+    return out
+
+
 # =============================================================================
 # Existing virtual position lifecycle
 # =============================================================================
@@ -744,7 +803,17 @@ def analyze_candidate(
     signature = structure_signature(smc)
 
     # Existing open virtual trade has priority.
+    # V0.5.4.1 先把 V0.5.3 舊持倉補上部位 / 成本欄位。
     if prev:
+        prev = backfill_legacy_position_costs(
+            prev,
+            virtual_capital=virtual_capital,
+            risk_pct=risk_pct,
+            fee_rate=fee_rate,
+            slippage_bps=slippage_bps,
+            leverage=leverage,
+        )
+
         lifecycle = evaluate_open_trade(
             prev,
             last,
@@ -1279,6 +1348,27 @@ def render_monitor():
         virtual_capital,
     )
 
+    active_positions = current_df[
+        current_df["監控狀態"].isin(
+            ["多頭訊號成立", "空頭訊號成立", "虛擬持倉監控", "TP1 已達・保本中"]
+        )
+    ].copy()
+
+    if not active_positions.empty:
+        active_notional = pd.to_numeric(
+            active_positions.get("名目部位USDT"),
+            errors="coerce",
+        ).fillna(0).sum()
+        active_risk = pd.to_numeric(
+            active_positions.get("原始1R_USDT"),
+            errors="coerce",
+        ).fillna(0).sum()
+
+        ps1, ps2, ps3 = st.columns(3)
+        ps1.metric("目前虛擬持倉數", len(active_positions))
+        ps2.metric("目前名目部位", f"{active_notional:,.2f} USDT")
+        ps3.metric("目前總風險", f"{active_risk:,.2f} USDT")
+
     st.markdown("### 虛擬策略績效")
 
     s1, s2, s3, s4, s5 = st.columns(5)
@@ -1368,6 +1458,7 @@ def render_monitor():
             "TP2",
             "虛擬數量",
             "名目部位USDT",
+            "風險預算USDT",
             "原始1R_USDT",
             "進場時間台灣",
             "持倉分鐘",
@@ -1403,14 +1494,15 @@ def render_monitor():
                 "精查分數",
                 "監控狀態",
                 "進場價",
+                "成交進場價",
                 "原始停損",
                 "TP1",
                 "TP2",
                 "出場價",
-                "成交進場價",
                 "成交出場價",
                 "虛擬數量",
                 "名目部位USDT",
+                "原始1R_USDT",
                 "結果R",
                 "淨R",
                 "毛損益USDT",
