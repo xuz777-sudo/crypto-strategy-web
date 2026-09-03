@@ -18,8 +18,8 @@ from strategy_engine import build_trade_plan
 # Page
 # =============================================================================
 
-st.set_page_config(page_title="5分K即時進場監控 V0.5.4.1", layout="wide")
-st.title("5分K 即時進出場監控 V0.5.4.1｜真實化虛擬績效")
+st.set_page_config(page_title="5分K即時進場監控 V0.5.4.2", layout="wide")
+st.title("5分K 即時進出場監控 V0.5.4.2｜淨風險＋總風險控制")
 st.caption(
     "讀取第二階段精查保存在 GitHub Private Repo 的候選，只更新候選的最新 5分K，"
     "不重新掃描全市場。所有交易皆為策略虛擬訊號，不代表 Bybit 真實下單。"
@@ -45,6 +45,7 @@ WAIT_STATUSES = {
     "等待多頭觸發",
     "等待空頭觸發",
     "等待新結構",
+    "風險額度已滿",
 }
 
 CLOSED_TRADE_STATUSES = {
@@ -226,7 +227,7 @@ def save_monitor_payload(rows, locks):
     cloud.save(
         MONITOR_KEY,
         {
-            "version": "V0.5.4.1",
+            "version": "V0.5.4.2",
             "rows": rows,
             "locks": locks,
             "updated_at_utc": now_utc_dt().isoformat(),
@@ -241,7 +242,7 @@ def save_history_rows(history):
     cloud.save(
         HISTORY_KEY,
         {
-            "version": "V0.5.4.1",
+            "version": "V0.5.4.2",
             "history": history,
             "updated_at_utc": now_utc_dt().isoformat(),
         },
@@ -402,39 +403,74 @@ def apply_exit_slippage(direction, raw_exit, slippage_bps):
     return raw_exit
 
 
+def stop_execution_price(direction, raw_stop, slippage_bps):
+    return apply_exit_slippage(direction, raw_stop, slippage_bps)
+
+
+def net_stop_loss_per_unit(
+    direction,
+    entry_exec,
+    raw_stop,
+    fee_rate,
+    slippage_bps,
+):
+    entry_exec = safe_float(entry_exec)
+    raw_stop = safe_float(raw_stop)
+    if not math.isfinite(entry_exec) or not math.isfinite(raw_stop):
+        return float("nan")
+
+    stop_exec = stop_execution_price(direction, raw_stop, slippage_bps)
+    if not math.isfinite(stop_exec):
+        return float("nan")
+
+    if direction == "多頭":
+        price_loss = max(0.0, entry_exec - stop_exec)
+    elif direction == "空頭":
+        price_loss = max(0.0, stop_exec - entry_exec)
+    else:
+        return float("nan")
+
+    fees = abs(entry_exec) * float(fee_rate) + abs(stop_exec) * float(fee_rate)
+    return price_loss + fees
+
+
 def position_metrics(
     virtual_capital,
     risk_pct,
+    direction,
     entry,
     stop,
     fee_rate,
+    slippage_bps,
     leverage,
+    available_portfolio_risk,
 ):
+    """
+    每筆風險%以含雙邊手續費與進/停損滑價後的淨停損損失反推部位大小。
+    """
     entry = safe_float(entry)
     stop = safe_float(stop)
-
-    if (
-        not math.isfinite(entry)
-        or not math.isfinite(stop)
-        or entry <= 0
-    ):
-        return {}
-
-    risk_per_unit = abs(entry - stop)
-    if risk_per_unit <= 0:
+    if not math.isfinite(entry) or not math.isfinite(stop) or entry <= 0:
         return {}
 
     capital = max(0.0, float(virtual_capital))
     risk_budget = capital * float(risk_pct) / 100.0
 
-    qty_by_risk = risk_budget / risk_per_unit
+    net_loss_unit = net_stop_loss_per_unit(
+        direction, entry, stop, fee_rate, slippage_bps
+    )
+    if not math.isfinite(net_loss_unit) or net_loss_unit <= 0:
+        return {}
+
+    qty_by_risk = risk_budget / net_loss_unit
     max_notional = capital * max(1.0, float(leverage))
     qty_by_leverage = max_notional / entry
-
     qty = min(qty_by_risk, qty_by_leverage)
+
     notional = qty * entry
-    effective_risk = qty * risk_per_unit
-    est_entry_fee = notional * float(fee_rate)
+    gross_price_risk = qty * abs(entry - stop)
+    net_stop_risk = qty * net_loss_unit
+    stop_exec = stop_execution_price(direction, stop, slippage_bps)
 
     return {
         "虛擬本金": capital,
@@ -443,12 +479,40 @@ def position_metrics(
         "槓桿倍數": float(leverage),
         "虛擬數量": qty,
         "名目部位USDT": notional,
-        "原始1R_USDT": effective_risk,
-        "預估進場手續費USDT": est_entry_fee,
+        "原始1R_USDT": gross_price_risk,
+        "淨停損風險USDT": net_stop_risk,
+        "目前淨風險USDT": net_stop_risk,
+        "預估停損成交價": stop_exec,
+        "預估進場手續費USDT": notional * float(fee_rate),
+        "預估停損手續費USDT": abs(stop_exec * qty) * float(fee_rate),
     }
 
 
+def current_position_net_risk(row, fee_rate, slippage_bps):
+    if not row:
+        return 0.0
+
+    direction = str(row.get("方向", ""))
+    entry_exec = safe_float(row.get("成交進場價", row.get("進場價")))
+    current_stop = safe_float(row.get("停損", row.get("原始停損")))
+    qty = safe_float(row.get("虛擬數量"), 0.0)
+
+    if (
+        not math.isfinite(entry_exec)
+        or not math.isfinite(current_stop)
+        or not math.isfinite(qty)
+        or qty <= 0
+    ):
+        return max(0.0, safe_float(row.get("淨停損風險USDT"), 0.0))
+
+    unit_loss = net_stop_loss_per_unit(
+        direction, entry_exec, current_stop, fee_rate, slippage_bps
+    )
+    return max(0.0, unit_loss * qty) if math.isfinite(unit_loss) else 0.0
+
+
 def calc_trade_pnl(
+
     row,
     raw_exit_price,
     fee_rate,
@@ -459,7 +523,9 @@ def calc_trade_pnl(
         row.get("成交進場價", row.get("進場價"))
     )
     qty = safe_float(row.get("虛擬數量"), 0.0)
-    original_r = safe_float(row.get("原始1R_USDT"))
+    original_r = safe_float(
+        row.get("淨停損風險USDT", row.get("原始1R_USDT"))
+    )
 
     exit_exec = apply_exit_slippage(
         direction,
@@ -583,9 +649,11 @@ def backfill_legacy_position_costs(
         sizing = position_metrics(
             virtual_capital=virtual_capital,
             risk_pct=risk_pct,
+            direction=direction,
             entry=exec_entry,
             stop=stop,
             fee_rate=fee_rate,
+            slippage_bps=slippage_bps,
             leverage=leverage,
         )
         out.update(sizing)
@@ -596,6 +664,17 @@ def backfill_legacy_position_costs(
     out.setdefault("費率%", float(fee_rate) * 100.0)
     out.setdefault("滑價bps", float(slippage_bps))
     out.setdefault("原始停損", stop)
+
+    existing_qty = safe_float(out.get("虛擬數量"), 0.0)
+    if existing_qty > 0:
+        unit_net_loss = net_stop_loss_per_unit(
+            direction, exec_entry, stop, fee_rate, slippage_bps
+        )
+        if math.isfinite(unit_net_loss):
+            out["淨停損風險USDT"] = existing_qty * unit_net_loss
+        out["目前淨風險USDT"] = current_position_net_risk(
+            out, fee_rate, slippage_bps
+        )
 
     return out
 
@@ -648,6 +727,9 @@ def evaluate_open_trade(prev, last_bar, smc, fee_rate, slippage_bps):
     # TP1 後停損移到 Entry。
     effective_stop = entry if tp1_done else original_stop
     out["停損"] = effective_stop
+    out["目前淨風險USDT"] = current_position_net_risk(
+        out, fee_rate, slippage_bps
+    )
 
     # 保守處理：同一根 K 同時碰停損與 TP，先視為停損 / 保本。
     if direction == "多頭":
@@ -890,9 +972,11 @@ def analyze_candidate(
     sizing = position_metrics(
         virtual_capital=virtual_capital,
         risk_pct=risk_pct,
+        direction=direction_zh,
         entry=exec_entry,
         stop=stop,
         fee_rate=fee_rate,
+        slippage_bps=slippage_bps,
         leverage=leverage,
     )
 
@@ -900,6 +984,18 @@ def analyze_candidate(
         "多頭訊號成立",
         "空頭訊號成立",
     }
+
+    proposed_net_risk = safe_float(
+        sizing.get("淨停損風險USDT"),
+        0.0,
+    )
+
+    if (
+        is_new_entry
+        and proposed_net_risk > max(0.0, float(available_portfolio_risk)) + 1e-9
+    ):
+        status = "風險額度已滿"
+        is_new_entry = False
 
     old = prev or {}
 
@@ -946,10 +1042,16 @@ def analyze_candidate(
             if is_new_entry
             else old.get("持倉分鐘")
         ),
+        "預估所需淨風險USDT": proposed_net_risk,
         "結果R": None,
         "提示": (
             "策略虛擬進場訊號成立；這不是 Bybit 真實下單。"
             if is_new_entry
+            else (
+                f"帳戶總風險額度不足；本訊號預估需要 "
+                f"{proposed_net_risk:.2f} USDT，等待其他持倉風險釋放。"
+            )
+            if status == "風險額度已滿"
             else "同一 BOS / CHoCH 已交易過，等待新的市場結構。"
             if status == "等待新結構"
             else "價格已離觸發點過遠，不追價。"
@@ -964,6 +1066,8 @@ def analyze_candidate(
         out.update(sizing)
         out["費率%"] = float(fee_rate) * 100.0
         out["滑價bps"] = float(slippage_bps)
+    elif status == "風險額度已滿":
+        out["預估所需淨風險USDT"] = proposed_net_risk
     elif prev:
         for key in [
             "虛擬本金",
@@ -1149,11 +1253,20 @@ virtual_capital = st.sidebar.number_input(
 )
 
 risk_pct = st.sidebar.slider(
-    "每筆風險（%本金）",
+    "每筆淨風險（%本金）",
     min_value=0.25,
     max_value=5.00,
     value=1.00,
     step=0.25,
+    help="包含進場/停損滑價與雙邊手續費後的最大預估淨停損風險。",
+)
+
+portfolio_risk_cap_pct = st.sidebar.slider(
+    "帳戶總開倉風險上限（%本金）",
+    min_value=1.0,
+    max_value=10.0,
+    value=3.0,
+    step=0.5,
 )
 
 leverage = st.sidebar.number_input(
@@ -1229,6 +1342,25 @@ def render_monitor():
     invalid_rows = []
     errors = []
 
+    portfolio_risk_cap_usdt = (
+        float(virtual_capital) * float(portfolio_risk_cap_pct) / 100.0
+    )
+
+    portfolio_risk_used = 0.0
+    for prev_row in previous_map.values():
+        if str(prev_row.get("監控狀態", "")) in OPEN_TRADE_STATUSES:
+            prev_fixed = backfill_legacy_position_costs(
+                prev_row,
+                virtual_capital=virtual_capital,
+                risk_pct=risk_pct,
+                fee_rate=fee_rate,
+                slippage_bps=slippage_bps,
+                leverage=leverage,
+            )
+            portfolio_risk_used += current_position_net_risk(
+                prev_fixed, fee_rate, slippage_bps
+            )
+
     progress = st.progress(0.0)
     live = st.empty()
 
@@ -1250,9 +1382,27 @@ def render_monitor():
                 fee_rate,
                 slippage_bps,
                 leverage,
+                max(0.0, portfolio_risk_cap_usdt - portfolio_risk_used),
             )
 
             status_text = str(result.get("監控狀態", ""))
+
+            previous_status = str(
+                (previous_map.get(symbol) or {}).get("監控狀態", "")
+            )
+            was_open = previous_status in OPEN_TRADE_STATUSES
+
+            if (
+                status_text in {"多頭訊號成立", "空頭訊號成立"}
+                and not was_open
+            ):
+                portfolio_risk_used += safe_float(
+                    result.get(
+                        "目前淨風險USDT",
+                        result.get("淨停損風險USDT"),
+                    ),
+                    0.0,
+                )
 
             if status_text in CLOSED_TRADE_STATUSES:
                 # Closed trade goes to history, not current monitor table.
@@ -1334,7 +1484,7 @@ def render_monitor():
 
     a, b, c, d = st.columns(4)
     a.metric("新虛擬進場訊號", signal_count)
-    b.metric("等待觸發／新結構", waiting_count)
+    b.metric("等待／新結構／風險額度", waiting_count)
     c.metric("虛擬持倉／TP1", virtual_position_count)
     d.metric("禁止追價／失效", invalid_count)
 
@@ -1354,20 +1504,30 @@ def render_monitor():
         )
     ].copy()
 
+    active_notional = 0.0
+    active_risk = 0.0
+
     if not active_positions.empty:
         active_notional = pd.to_numeric(
             active_positions.get("名目部位USDT"),
             errors="coerce",
         ).fillna(0).sum()
         active_risk = pd.to_numeric(
-            active_positions.get("原始1R_USDT"),
+            active_positions.get("目前淨風險USDT"),
             errors="coerce",
         ).fillna(0).sum()
 
-        ps1, ps2, ps3 = st.columns(3)
-        ps1.metric("目前虛擬持倉數", len(active_positions))
-        ps2.metric("目前名目部位", f"{active_notional:,.2f} USDT")
-        ps3.metric("目前總風險", f"{active_risk:,.2f} USDT")
+    risk_cap_usdt = float(virtual_capital) * float(portfolio_risk_cap_pct) / 100.0
+    remaining_risk = max(0.0, risk_cap_usdt - active_risk)
+
+    ps1, ps2, ps3, ps4 = st.columns(4)
+    ps1.metric("目前虛擬持倉數", len(active_positions))
+    ps2.metric("目前名目部位", f"{active_notional:,.2f} USDT")
+    ps3.metric(
+        "目前淨風險 / 上限",
+        f"{active_risk:,.2f} / {risk_cap_usdt:,.2f} USDT",
+    )
+    ps4.metric("剩餘風險額度", f"{remaining_risk:,.2f} USDT")
 
     st.markdown("### 虛擬策略績效")
 
@@ -1407,8 +1567,8 @@ def render_monitor():
         f'獲利 {stats["獲利筆"]} 筆 ｜ '
         f'虧損 {stats["虧損筆"]} 筆 ｜ '
         f'保本 {stats["保本筆"]} 筆。'
-        "毛 R 以原始 Entry→Stop 風險距離為 1R；"
-        "V0.5.4 另計手續費、滑價、淨R與淨損益 USDT。"
+        "毛 R 以原始 Entry→Stop 價差為基準；"
+        "V0.5.4.2 的每筆風險%已含雙邊手續費與進出場滑價，並限制帳戶總風險。"
     )
 
     # -----------------------------------------------------------------
@@ -1428,6 +1588,7 @@ def render_monitor():
             "等待多頭觸發": 3,
             "等待空頭觸發": 3,
             "等待新結構": 4,
+            "風險額度已滿": 4,
             "禁止追價": 5,
             "訊號失效": 6,
         }
@@ -1460,6 +1621,9 @@ def render_monitor():
             "名目部位USDT",
             "風險預算USDT",
             "原始1R_USDT",
+            "淨停損風險USDT",
+            "目前淨風險USDT",
+            "預估所需淨風險USDT",
             "進場時間台灣",
             "持倉分鐘",
             "最後更新台灣",
@@ -1503,6 +1667,7 @@ def render_monitor():
                 "虛擬數量",
                 "名目部位USDT",
                 "原始1R_USDT",
+                "淨停損風險USDT",
                 "結果R",
                 "淨R",
                 "毛損益USDT",

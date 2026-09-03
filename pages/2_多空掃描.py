@@ -1177,7 +1177,7 @@ st.sidebar.caption(
     "V0.5.2 會在每一批第一階段掃描與第二階段精查完成後，自動保存到 Private Repo。重新整理或重新開啟網站時會自動恢復，因此已移除手動 CSV 復原區。"
 )
 
-st.sidebar.markdown("### V0.4 第二階段精查")
+st.sidebar.markdown("### 第二階段精查")
 
 precision_include_mode = st.sidebar.radio(
     "精查候選",
@@ -1694,7 +1694,7 @@ if current_position >= total:
 
 if current_position >= total:
     st.markdown("---")
-    st.markdown("## V0.4 第二階段精查")
+    st.markdown("## 第二階段精查")
     st.caption(
         "第一階段只用多週期 SMC 快速篩選；第二階段只針對多空就緒與高分觀察標的，"
         "重新取得最新 K 線，再加入 Open Interest、Funding、Long/Short Ratio、"
@@ -2039,7 +2039,7 @@ if current_position >= total:
                 ).encode("utf-8-sig")
 
                 st.download_button(
-                    "下載 V0.4 第二階段精查結果 CSV",
+                    "下載第二階段精查結果 CSV",
                     data=precision_csv,
                     file_name="bybit_precision_scan_v04.csv",
                     mime="text/csv",
